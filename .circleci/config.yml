@@ -1,0 +1,100 @@
+version: 2.1
+
+jobs:
+  validate-chromatography:
+    docker:
+      - image: cimg/python:3.13
+
+    working_directory: ~/project
+
+    steps:
+      - checkout
+
+      - restore_cache:
+          keys:
+            - chromatography-v1-{{ checksum "applications/chromatography/requirements-dev.txt" }}
+            - chromatography-v1-
+
+      - run:
+          name: Create virtual environment and install dependencies
+          command: |
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip
+            python -m pip install -r applications/chromatography/requirements-dev.txt
+
+      - save_cache:
+          key: chromatography-v1-{{ checksum "applications/chromatography/requirements-dev.txt" }}
+          paths:
+            - .venv
+
+      - run:
+          name: Lint application
+          command: |
+            source .venv/bin/activate
+            python -m ruff check applications/chromatography
+
+      - run:
+          name: Run unit tests
+          command: |
+            source .venv/bin/activate
+            python -m pytest applications/chromatography/tests -v \
+              --cov=applications/chromatography
+
+      - run:
+          name: Audit production dependencies
+          command: |
+            source .venv/bin/activate
+            python -m pip_audit \
+              -r applications/chromatography/requirements.txt
+
+      - setup_remote_docker
+
+      - run:
+          name: Build application image
+          command: |
+            docker build \
+              -t chromatography-insights:${CIRCLE_SHA1} \
+              applications/chromatography
+
+      - run:
+          name: Start container
+          command: |
+            docker run -d \
+              --name chromatography-insights \
+              -p 5000:5000 \
+              -e APP_ENV=test \
+              chromatography-insights:${CIRCLE_SHA1}
+
+      - run:
+          name: Wait for application health
+          command: |
+            for attempt in $(seq 1 12); do
+              if docker exec chromatography-insights \
+                python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"; then
+                echo "Application is healthy."
+                exit 0
+              fi
+
+              echo "Waiting for application. Attempt ${attempt} of 12."
+              sleep 5
+            done
+
+            echo "Application failed its health check."
+            docker logs chromatography-insights
+            exit 1
+
+      - run:
+          name: Display container logs
+          when: on_fail
+          command: docker logs chromatography-insights || true
+
+      - run:
+          name: Stop test container
+          when: always
+          command: docker rm -f chromatography-insights || true
+
+workflows:
+  chromatography-validation:
+    jobs:
+      - validate-chromatography
